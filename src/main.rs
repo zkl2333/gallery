@@ -1,5 +1,5 @@
 use clap::{crate_authors, crate_description, crate_version, Arg, ArgAction, Command};
-use image::{imageops, ImageBuffer, ImageError, Rgba};
+use image::{imageops, GenericImageView, ImageBuffer, ImageError, Rgba};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info};
@@ -79,84 +79,109 @@ async fn main() -> Result<(), ImageError> {
 
     info!("正在从 {} 目录下实时读取并处理图像", directory);
 
-    create_poster_realtime(&directory, width, height, gap).await?;
+    create_poster(&directory, width, height, gap).await?;
 
     Ok(())
 }
 
-async fn create_poster_realtime(
+// 获取图片的宽度和高度
+fn get_image_dimensions(img: &image::DynamicImage) -> (u32, u32) {
+    let (width, height) = img.dimensions();
+    (width, height)
+}
+
+// 计算 resize 后的宽度和高度 (保持原始宽高比, 但高度固定)
+fn calculate_new_dimensions(
+    img: &image::DynamicImage,
+    _new_width: u32,
+    new_height: u32,
+) -> (u32, u32) {
+    let (width, height) = get_image_dimensions(img);
+    let ratio = height as f32 / new_height as f32;
+    let new_width = (width as f32 / ratio) as u32;
+    (new_width, new_height)
+}
+
+async fn create_poster(
     directory: &str,
     width: u32,
     height: u32,
     gap: u32,
 ) -> Result<(), ImageError> {
     const IMG_WIDTH: u32 = 1000; // 每张图像调整后的宽度
-    let img_height: u32 = (height - (gap * 5)) / 6; // 每张图像调整后的高度
+    let img_height: u32 = (height - (gap * 9)) / 10; // 每张图像调整后的高度
+
+    let mut x: i64 = 0;
+    let mut y: i64 = 0;
+    let mut line: u32 = 0;
+
+    let mut entries = tokio::fs::read_dir(directory).await?;
 
     let poster: Arc<Mutex<ImageBuffer<Rgba<u8>, Vec<u8>>>> =
         Arc::new(Mutex::new(ImageBuffer::new(width, height)));
 
-    let x: Arc<Mutex<i64>> = Arc::new(Mutex::new(0));
-    let y: Arc<Mutex<i64>> = Arc::new(Mutex::new(0));
-    let line: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
-
-    let mut entries = tokio::fs::read_dir(directory).await?;
-
     // 为了并行处理图像，收集所有的异步任务
     let mut tasks = Vec::new();
 
-    while let Some(entry) = entries.next_entry().await? {
-        let path = entry.path();
-        let poster_clone = poster.clone();
-        let x_clone = x.clone();
-        let y_clone = y.clone();
-        let line_clone = line.clone();
-        if path.is_file() {
-            let task = tokio::spawn(async move {
+    // 首尾相连的循环
+    'outer: loop {
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path.is_file() {
                 match image::open(&path) {
                     Ok(img) => {
-                        let mut y_guard = y_clone.lock().await;
-                        if *y_guard > height as i64 {
-                            return;
-                        }
-                        debug!("正在压缩图像: {:?}", path.file_name().unwrap());
-                        let img = img.resize(
-                            IMG_WIDTH,
-                            img_height,
-                            image::imageops::FilterType::Lanczos3,
-                        );
-                        let img = img.to_rgba8();
-                        let (w, _h) = img.dimensions();
-
-                        let mut poster = poster_clone.lock().await;
-                        let mut x_guard = x_clone.lock().await;
-                        let mut line_guard = line_clone.lock().await;
-
-                        if *y_guard > height as i64 {
-                            return;
+                        if y > height as i64 {
+                            break 'outer;
                         }
 
-                        debug!("正在绘制图像: {:?}", path.file_name().unwrap());
-                        imageops::overlay(&mut *poster, &img, *x_guard, *y_guard);
-                        debug!("图像处理完成 坐标: ({}, {})", x_guard, y_guard);
+                        // 计算 resize 后的宽度和高度
+                        let (w, _h) = calculate_new_dimensions(&img, IMG_WIDTH, img_height);
 
-                        if *x_guard < width as i64 {
-                            *x_guard += w as i64 + gap as i64;
+                        // 分配位置
+                        let task_x = x;
+                        let task_y = y;
+
+                        // 更新坐标
+                        if x < width as i64 {
+                            x += w as i64 + gap as i64;
                         } else {
-                            *line_guard += 1;
-                            *y_guard += img_height as i64 + gap as i64;
-                            if *line_guard % 2 == 1 {
-                                *x_guard = 0 - (img_height as i64 / 2);
+                            line += 1;
+                            y += img_height as i64 + gap as i64;
+                            if line % 2 == 1 {
+                                x = 0 - (img_height as i64 / 2);
                             } else {
-                                *x_guard = 0;
+                                x = 0;
                             }
                         }
+
+                        debug!("分配位置: ({}, {})", x, y);
+
+                        let poster = poster.clone();
+                        // 异步处理图像
+                        let task = tokio::spawn(async move {
+                            debug!("正在压缩图像: {:?}", path.file_name().unwrap());
+                            let img = img.resize(
+                                IMG_WIDTH,
+                                img_height,
+                                // image::imageops::FilterType::Lanczos3,
+                                image::imageops::FilterType::Nearest,
+                            );
+                            let mut poster = poster.lock().await;
+                            imageops::overlay(&mut *poster, &img, task_x, task_y);
+                            debug!(
+                                "图像 {:?} 处理完成 坐标: ({}, {})",
+                                path.file_name().unwrap(),
+                                task_x,
+                                task_y
+                            );
+                        });
+                        tasks.push(task);
                     }
                     Err(e) => error!("无法打开图像 {:?}: {:?}", path, e),
                 }
-            });
-            tasks.push(task);
+            }
         }
+        entries = tokio::fs::read_dir(directory).await?;
     }
 
     // 等待所有任务完成
@@ -164,9 +189,10 @@ async fn create_poster_realtime(
         let _ = task.await;
     }
 
-    poster.lock().await.save("poster.png")?;
-
-    info!("海报墙已保存为 poster.png");
+    // 保存海报墙
+    info!("正在保存海报墙");
+    let poster = poster.lock().await;
+    poster.save_with_format("poster.png", image::ImageFormat::Png)?;
 
     Ok(())
 }
