@@ -91,7 +91,7 @@ async fn create_poster_realtime(
     gap: u32,
 ) -> Result<(), ImageError> {
     const IMG_WIDTH: u32 = 1000; // 每张图像调整后的宽度
-    let img_height: u32 = (height - (gap * 4)) / 5; // 每张图像调整后的高度
+    let img_height: u32 = (height - (gap * 5)) / 6; // 每张图像调整后的高度
 
     let poster: Arc<Mutex<ImageBuffer<Rgba<u8>, Vec<u8>>>> =
         Arc::new(Mutex::new(ImageBuffer::new(width, height)));
