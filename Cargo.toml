@@ -1,10 +1,12 @@
 [package]
 name = "gallery"
 version = "0.1.0"
+authors = ["多吃点 <i@zkl2333.com>"]
+description = "用于从目录中的图像生成海报墙"
 edition = "2021"
 
 [dependencies]
-clap = "4.5.2"
+clap = { version = "4.5.2", features = ["cargo"] }
 image = "0.24.9"
 tokio = { version = "1.36.0", features = ["full"] }
 tracing = "0.1.40"

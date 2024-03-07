@@ -1,4 +1,4 @@
-use clap::{Arg, Command};
+use clap::{crate_authors, crate_description, crate_version, Arg, ArgAction, Command};
 use image::{imageops, ImageBuffer, ImageError, Rgba};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -7,10 +7,26 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
 async fn main() -> Result<(), ImageError> {
-    let matches = Command::new("海报墙生成器")
-        .version("1.0")
-        .author("多吃点 <i@zkl2333.com>")
-        .about("实时从目录中的图像生成海报墙")
+    let cmd = Command::new("海报墙生成器")
+        .disable_help_flag(true)
+        .disable_version_flag(true)
+        .version(crate_version!())
+        .author(crate_authors!())
+        .about(crate_description!())
+        .arg(
+            Arg::new("help")
+                .short('?')
+                .long("help")
+                .help("显示帮助信息")
+                .action(ArgAction::Help),
+        )
+        .arg(
+            Arg::new("version")
+                .short('v')
+                .long("version")
+                .help("显示版本信息")
+                .action(ArgAction::Version),
+        )
         .arg(
             Arg::new("directory")
                 .short('d')
@@ -19,11 +35,40 @@ async fn main() -> Result<(), ImageError> {
                 .help("指定图像所在的目录")
                 .default_value("."),
         )
-        .get_matches();
+        .arg(
+            Arg::new("width")
+                .short('w')
+                .long("width")
+                .value_name("width")
+                .help("指定海报墙的宽度")
+                .default_value("4096"),
+        )
+        .arg(
+            Arg::new("height")
+                .short('h')
+                .long("height")
+                .value_name("height")
+                .help("指定海报墙的高度")
+                .default_value("2160"),
+        )
+        .arg(
+            Arg::new("gap")
+                .short('g')
+                .long("gap")
+                .value_name("gap")
+                .help("指定图像之间的间隙")
+                .default_value("10"),
+        );
 
-    let directory = matches
-        .get_one::<String>("directory")
-        .expect("directory 参数必须存在");
+    let matches = cmd.get_matches();
+    let directory: &String = matches.get_one::<String>("directory").unwrap();
+    let width: u32 = matches.get_one::<String>("width").unwrap().parse().unwrap();
+    let height: u32 = matches
+        .get_one::<String>("height")
+        .unwrap()
+        .parse()
+        .unwrap();
+    let gap: u32 = matches.get_one::<String>("gap").unwrap().parse().unwrap();
 
     // 创建针对终端的Layer
     let stdout_layer = fmt::layer()
@@ -34,20 +79,22 @@ async fn main() -> Result<(), ImageError> {
 
     info!("正在从 {} 目录下实时读取并处理图像", directory);
 
-    create_poster_realtime(directory).await?;
+    create_poster_realtime(&directory, width, height, gap).await?;
 
     Ok(())
 }
 
-async fn create_poster_realtime(directory: &str) -> Result<(), ImageError> {
-    const WIDTH: u32 = 4096;
-    const HEIGHT: u32 = 2160;
+async fn create_poster_realtime(
+    directory: &str,
+    width: u32,
+    height: u32,
+    gap: u32,
+) -> Result<(), ImageError> {
     const IMG_WIDTH: u32 = 1000; // 每张图像调整后的宽度
-    const IMG_HEIGHT: u32 = 400; // 每张图像调整后的高度
-    const GAP: u32 = 10; // 图像间的间隙
+    let img_height: u32 = (height - (gap * 4)) / 5; // 每张图像调整后的高度
 
     let poster: Arc<Mutex<ImageBuffer<Rgba<u8>, Vec<u8>>>> =
-        Arc::new(Mutex::new(ImageBuffer::new(WIDTH, HEIGHT)));
+        Arc::new(Mutex::new(ImageBuffer::new(width, height)));
 
     let x: Arc<Mutex<i64>> = Arc::new(Mutex::new(0));
     let y: Arc<Mutex<i64>> = Arc::new(Mutex::new(0));
@@ -68,10 +115,14 @@ async fn create_poster_realtime(directory: &str) -> Result<(), ImageError> {
             let task = tokio::spawn(async move {
                 match image::open(&path) {
                     Ok(img) => {
+                        let mut y_guard = y_clone.lock().await;
+                        if *y_guard > height as i64 {
+                            return;
+                        }
                         debug!("正在压缩图像: {:?}", path.file_name().unwrap());
                         let img = img.resize(
                             IMG_WIDTH,
-                            IMG_HEIGHT,
+                            img_height,
                             image::imageops::FilterType::Lanczos3,
                         );
                         let img = img.to_rgba8();
@@ -79,29 +130,27 @@ async fn create_poster_realtime(directory: &str) -> Result<(), ImageError> {
 
                         let mut poster = poster_clone.lock().await;
                         let mut x_guard = x_clone.lock().await;
-                        let mut y_guard = y_clone.lock().await;
                         let mut line_guard = line_clone.lock().await;
 
-                        if *y_guard > HEIGHT as i64 {
+                        if *y_guard > height as i64 {
                             return;
                         }
 
                         debug!("正在绘制图像: {:?}", path.file_name().unwrap());
                         imageops::overlay(&mut *poster, &img, *x_guard, *y_guard);
+                        debug!("图像处理完成 坐标: ({}, {})", x_guard, y_guard);
 
-                        if *x_guard < WIDTH as i64 {
-                            *x_guard += w as i64 + GAP as i64;
+                        if *x_guard < width as i64 {
+                            *x_guard += w as i64 + gap as i64;
                         } else {
                             *line_guard += 1;
-                            *y_guard += IMG_HEIGHT as i64 + GAP as i64;
+                            *y_guard += img_height as i64 + gap as i64;
                             if *line_guard % 2 == 1 {
-                                *x_guard = 0 - (IMG_HEIGHT as i64 / 2);
+                                *x_guard = 0 - (img_height as i64 / 2);
                             } else {
                                 *x_guard = 0;
                             }
                         }
-
-                        debug!("图像处理完成 坐标: ({}, {})", x_guard, y_guard);
                     }
                     Err(e) => error!("无法打开图像 {:?}: {:?}", path, e),
                 }
