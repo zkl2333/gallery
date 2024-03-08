@@ -1,6 +1,10 @@
 use clap::{crate_authors, crate_description, crate_version, Arg, ArgAction, Command};
-use image::{imageops, GenericImageView, ImageBuffer, ImageError, Rgba};
-use std::sync::Arc;
+use image::{
+    imageops, GenericImageView, ImageBuffer, ImageEncoder, ImageError, Pixel, Rgba, RgbaImage,
+};
+use imagequant::RGBA;
+use oxipng::{optimize_from_memory, Options};
+use std::{fs, sync::Arc};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt};
@@ -102,6 +106,80 @@ fn calculate_new_dimensions(
     (new_width, new_height)
 }
 
+// 压缩图像质量的函数
+fn compress_png(input_img: &RgbaImage) -> RgbaImage {
+    let mut liq = imagequant::new();
+    liq.set_speed(4).unwrap();
+    liq.set_quality(0, 70).unwrap();
+    let mut rgba_vec: Vec<RGBA> = Vec::new();
+    for pixel in input_img.pixels() {
+        let rgba = pixel.to_rgba();
+        rgba_vec.push(RGBA {
+            r: rgba[0],
+            g: rgba[1],
+            b: rgba[2],
+            a: rgba[3],
+        });
+    }
+    let mut img = liq
+        .new_image(
+            rgba_vec,
+            input_img.width().try_into().unwrap(),
+            input_img.height().try_into().unwrap(),
+            0.0,
+        )
+        .unwrap();
+
+    // 进行量化处理
+    let mut res = match liq.quantize(&mut img) {
+        Ok(res) => res,
+        Err(err) => panic!("量化处理失败: {err:?}"),
+    };
+
+    // 启用抖动以进行后续重新映射
+    res.set_dithering_level(0.7).unwrap();
+
+    // 可以重复使用结果生成具有相同调色板的多个图像
+    let (palette, pixels) = res.remapped(&mut img).unwrap();
+
+    info!(
+        "完成！得到调色板 {} 和 {} 个像素，质量为 {}%",
+        palette.len(),
+        pixels.len(),
+        res.quantization_quality().unwrap()
+    );
+
+    // 将调色板和像素重新映射到图像
+    let mut img: RgbaImage = RgbaImage::new(input_img.width(), input_img.height());
+    for (x, y, pixel) in img.enumerate_pixels_mut() {
+        let index = pixels[(y * input_img.width() + x) as usize] as usize; // 获取当前像素对应的调色板索引
+        let rgba = palette[index]; // 获取调色板中的颜色
+        *pixel = Rgba([rgba.r, rgba.g, rgba.b, rgba.a]); // 设置像素颜色
+    }
+
+    let mut buf: Vec<u8> = Vec::new();
+    image::codecs::png::PngEncoder::new(&mut buf)
+        .write_image(&img, img.width(), img.height(), image::ColorType::Rgba8)
+        .unwrap();
+
+    // 设置oxipng的选项
+    let options = Options::from_preset(2); // 使用预设级别2，你可以根据需要调整这个值
+
+    // 使用optimize_from_memory函数优化PNG数据
+    match optimize_from_memory(&buf, &options) {
+        Ok(output_data) => {
+            // 将优化后的数据写入文件
+            fs::write("poster_compressed.png", &output_data).expect("Failed to write output file");
+            println!("PNG optimization completed successfully.");
+        }
+        Err(e) => {
+            eprintln!("Failed to optimize PNG: {:?}", e);
+        }
+    }
+
+    img
+}
+
 async fn create_poster(
     directory: &str,
     width: u32,
@@ -110,6 +188,7 @@ async fn create_poster(
 ) -> Result<(), ImageError> {
     const IMG_WIDTH: u32 = 1000; // 每张图像调整后的宽度
     let img_height: u32 = (height - (gap * 9)) / 10; // 每张图像调整后的高度
+    let img_height = if img_height < 100 { 100 } else { img_height };
 
     let mut x: i64 = 0;
     let mut y: i64 = 0;
@@ -163,8 +242,8 @@ async fn create_poster(
                             let img = img.resize(
                                 IMG_WIDTH,
                                 img_height,
-                                // image::imageops::FilterType::Lanczos3,
-                                image::imageops::FilterType::Nearest,
+                                image::imageops::FilterType::Lanczos3,
+                                // image::imageops::FilterType::Nearest,
                             );
                             let mut poster = poster.lock().await;
                             imageops::overlay(&mut *poster, &img, task_x, task_y);
@@ -192,7 +271,13 @@ async fn create_poster(
     // 保存海报墙
     info!("正在保存海报墙");
     let poster = poster.lock().await;
-    poster.save_with_format("poster.png", image::ImageFormat::Png)?;
+    poster
+        .clone()
+        .save_with_format("poster.png", image::ImageFormat::Png)?;
 
+    info!("海报墙已保存为 poster.png");
+    info!("正在压缩海报墙");
+    let img = compress_png(&poster.clone());
+    // img.save("poster_compressed.png")?;
     Ok(())
 }
